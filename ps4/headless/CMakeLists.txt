@@ -89,6 +89,9 @@ string(SUBSTRING "${_sdk_tp}" ${_ff_begin} ${_ff_len} _ff_block)
 string(REPLACE "\${CMAKE_CURRENT_SOURCE_DIR}" "${T}" _ff_block "${_ff_block}")
 file(WRITE ${CMAKE_BINARY_DIR}/ffmpeg_block.cmake "${_ff_block}")
 include(${CMAKE_BINARY_DIR}/ffmpeg_block.cmake)
+# FFmpeg's config.h has no PS4 branch: ours (ffmpeg-ps4/config.h) goes first on the include path.
+target_include_directories(libavutil BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/ffmpeg-ps4)
+target_include_directories(libavcodec BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/ffmpeg-ps4)
 
 # ReXGlue, the headless subset -----------------------------------------------------------------
 function(rex_srcs out dir)
