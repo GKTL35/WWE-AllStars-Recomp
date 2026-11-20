@@ -1,0 +1,86 @@
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..9418bc5 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -16,6 +16,7 @@
+ #include <cstdint>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/platform.h>
+ 
+ namespace rex {
+ using hundrednano = std::ratio<1, 10000000>;
+@@ -116,8 +117,8 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || REX_PLATFORM_PS4
++// Apple libc++ (and the PS4 toolchain's libc++) does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 7c10bc9..bd3b9fa 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -371,7 +371,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       mcontext.mc_rflags = thread_context.eflags;
+       uint32_t modified_register_index;
+       // The order must match the order in X64Register.
+-      register_t* const kIntRegisterMap[] = {
++      using Ps4Reg = decltype(mcontext.mc_rax);
++      Ps4Reg* const kIntRegisterMap[] = {
+           &mcontext.mc_rax, &mcontext.mc_rcx, &mcontext.mc_rdx, &mcontext.mc_rbx,
+           &mcontext.mc_rsp, &mcontext.mc_rbp, &mcontext.mc_rsi, &mcontext.mc_rdi,
+           &mcontext.mc_r8,  &mcontext.mc_r9,  &mcontext.mc_r10, &mcontext.mc_r11,
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 6505772..4714bd7 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -755,6 +755,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
+         rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
+       }
++#elif REX_PLATFORM_PS4
++      // No pthread_getname_np in the PS4 libc; names are only used for logging.
++      result[0] = '\0';
+ #else
+       if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
+         assert_always();
+@@ -922,8 +925,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return;
+     }
+ 
+-#if defined(__APPLE__)
+-    // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
++#if defined(__APPLE__) || REX_PLATFORM_PS4
++    // macOS and the PS4 have no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+     // without the sigval payload.
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+ #else
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 58e36a4..b314166 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -14,8 +14,9 @@
+ 
+ #include <cstring>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS4
+ #include <sys/select.h>
++#include <sys/time.h>
+ #endif
+ 
+ #include <rex/chrono/clock.h>
+@@ -37,7 +38,7 @@
+ // NOTE: must be included last as it expects windows.h to already be included.
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
+ #include <winsock2.h>                    // NOLINT(build/include_order)
+-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS4
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
