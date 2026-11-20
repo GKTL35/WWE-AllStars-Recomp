@@ -141,6 +141,7 @@ switch was run natively on Linux x86-64 (`ps4/tests/fiber_ps4_selftest.cpp`).** 
 | `clock_posix.cpp` | fixed 1 GHz tick rate (the PS4's `clock_getres` says 2 ns), `CLOCK_MONOTONIC` | uncompiled |
 | `threading_posix.cpp` | thread id, names, priorities (guest -15..+15 mapped to PS4 256..767), affinity via libkernel | uncompiled; assumes `pthread_t` is the `ScePthread` |
 | `exception_handler_posix.cpp` | fault handler using the FreeBSD register layout from ps4-kit's overlay; SIGBUS handled too | uncompiled |
+| `dbg_posix.cpp`, `filesystem_posix.cpp` | no `/proc`: debugger check returns false, executable path `/app0/eboot.bin`, user folder `/data` | uncompiled |
 
 Known problems in it:
 
@@ -148,8 +149,10 @@ Known problems in it:
   two separate reservations (aliasing would cost 256 MiB of real RAM).
 - Direct memory needs `sceKernelEnableDmemAliasing`; if the kernel refuses it, the mirrors cannot work.
 - The 0xE0000000 view (4 KiB higher) relies on the SDK's existing larger-host-page path.
-- Still to adapt: `socket_posix`, `dynlib_posix`, `env_posix`, `console_posix`, `seh_posix`, `atomic_posix`,
-  `xthread.cpp`, the kernel's `xam_net.cpp`, and any other `REX_PLATFORM_LINUX` code. They were not read yet.
+- Read and judged portable as they are (they only assert POSIX): `atomic_posix`, `dynlib_posix`, `env_posix`,
+  `console_posix`, `socket_posix`. `seh_posix` throws C++ exceptions from a signal handler and needs a test on the console.
+  `mapped_memory_posix` (file mappings) is unchecked on the PS4. Not read yet: `xthread.cpp`, the kernel's `xam_net.cpp`,
+  `xboxkrnl_threading.cpp` and the rest of the `REX_PLATFORM_LINUX` code outside `src/core`.
 - The OpenOrbis git repository has no libc headers (they ship in its release bundle), so none of this
   could be syntax-checked here against the real headers.
 

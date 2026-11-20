@@ -132,6 +132,28 @@ index 00f2382..921214e 100644
    assert_zero(error);
  
    return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+diff --git a/src/core/dbg_posix.cpp b/src/core/dbg_posix.cpp
+index d1eb7d6..a2dde18 100644
+--- a/src/core/dbg_posix.cpp
++++ b/src/core/dbg_posix.cpp
+@@ -24,6 +24,7 @@
+ #endif
+ 
+ #include <rex/dbg.h>
++#include <rex/platform.h>
+ 
+ namespace rex::debug {
+ 
+@@ -38,6 +39,9 @@ bool IsDebuggerAttached() {
+     return false;
+   }
+   return (process_info.kp_proc.p_flag & P_TRACED) != 0;
++#elif REX_PLATFORM_PS4
++  // No /proc on the PS4; nothing here reports a tracer.
++  return false;
+ #else
+   std::ifstream proc_status_stream("/proc/self/status");
+   if (!proc_status_stream.is_open()) {
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
 index 8b1c76a..7c10bc9 100644
 --- a/src/core/exception_handler_posix.cpp
@@ -419,6 +441,47 @@ index 0000000..5329c07
 +}  // namespace rex::thread
 +
 +#endif  // REX_PLATFORM_PS4
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..7efae7c 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -16,6 +16,7 @@
+ #include <iostream>
+ 
+ #include <fcntl.h>
++#include <rex/platform.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -91,6 +92,9 @@ std::filesystem::path GetExecutablePath() {
+   std::error_code ec;
+   std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
+   return ec ? std::filesystem::path(executable_path) : canonical_path;
++#elif REX_PLATFORM_PS4
++  // A homebrew app's own files are mounted at /app0 (the eboot is /app0/eboot.bin).
++  return std::filesystem::path("/app0/eboot.bin");
+ #else
+   char buff[FILENAME_MAX] = "";
+   readlink("/proc/self/exe", buff, FILENAME_MAX);
+@@ -104,6 +108,10 @@ std::filesystem::path GetExecutableFolder() {
+ }
+ 
+ std::filesystem::path GetUserFolder() {
++#if REX_PLATFORM_PS4
++  // /data is the writable area GoldHEN apps use; no passwd database or HOME on the console.
++  return std::filesystem::path("/data");
++#else
+   // get preferred data home
+   if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
+     return std::filesystem::path(*xdg);
+@@ -121,6 +129,7 @@ std::filesystem::path GetUserFolder() {
+   getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
+   assert(&pw1 == pw);  // sanity check
+   return std::filesystem::path(pw->pw_dir) / ".local" / "share";
++#endif  // REX_PLATFORM_PS4
+ }
+ 
+ FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
 diff --git a/src/core/memory_ps4.cpp b/src/core/memory_ps4.cpp
 new file mode 100644
 index 0000000..55a0434
