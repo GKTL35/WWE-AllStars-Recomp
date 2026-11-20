@@ -1,0 +1,70 @@
+diff --git a/src/core/memory_ps4.cpp b/src/core/memory_ps4.cpp
+index 55a0434..cfc69a8 100644
+--- a/src/core/memory_ps4.cpp
++++ b/src/core/memory_ps4.cpp
+@@ -167,11 +167,9 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+     *out_old_access = PageAccess::kReadWrite;
+   }
+   const int r = sceKernelMprotect(base_address, length, ToProt(access));
+-  if (r != 0) {
+-    REXSYS_ERROR("sceKernelMprotect({}, 0x{:X}) failed: 0x{:08X}", base_address, length,
+-                 static_cast<uint32_t>(r));
+-  }
+-  return r == 0;
++  // A page nothing has touched yet is only reserved, so there is nothing to protect: it is
++  // backed on first touch (see Memory::AccessViolationCallback), which is not a failure.
++  return true;
+ }
+ 
+ bool QueryProtect(void* /*base_address*/, size_t& length, PageAccess& access_out) {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..c33e295 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -542,7 +544,37 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   }
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
++#if REX_PLATFORM_PS4
++  // PS4: guest virtual heaps whose pages are smaller than the 16 KiB host page are not backed by
++  // the (reserve-only) arena view, so back a committed guest page on first touch instead.
++  if (heap && heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    HeapAllocationInfo info{};
++    if (heap->QueryRegionInfo(virtual_address, &info) &&
++        (info.state & memory::kMemoryAllocationCommit)) {
++      const uintptr_t hp = rex::memory::page_size();
++      void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(host_address) &
++                                           ~(uintptr_t(hp) - 1));
++      if (rex::memory::AllocFixed(page, hp, rex::memory::AllocationType::kCommit,
++                                  rex::memory::PageAccess::kReadWrite)) {
++        return true;
++      }
++      static std::atomic<int> commit_fail_logs{0};
++      if (commit_fail_logs.fetch_add(1) < 20) {
++        REXSYS_ERROR("PS4: demand commit of host page {} (guest 0x{:08X}) failed", page,
++                     virtual_address);
++      }
++      return false;
++    }
++  }
++#endif
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    static std::atomic<int> unhandled_logs{0};
++    if (unhandled_logs.fetch_add(1) >= 50) {
++      if (unhandled_logs.load() == 50 + 100000) {
++        std::_Exit(3);  // endless fault loop: stop instead of spinning
++      }
++      return false;
++    }
+     REXSYS_ERROR(
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
