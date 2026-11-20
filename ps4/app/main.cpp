@@ -43,7 +43,7 @@ std::unique_ptr<rex::system::IInputSystem> CreatePs4InputSystem(bool tool_mode) 
   auto input = rex::input::CreateDefaultInputSystem(tool_mode);
   if (!tool_mode) {
     auto pads = std::make_unique<rex::input::ps4::Ps4InputDriver>(nullptr, 0);
-    if (pads->Setup() == X_STATUS_SUCCESS) {
+    if (!XFAILED(pads->Setup())) {
       input->AddDriver(std::move(pads));
     }
   }
