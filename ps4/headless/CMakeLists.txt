@@ -73,6 +73,23 @@ target_link_libraries(rex_tp PUBLIC rex_tp_headers)
 target_compile_definitions(rex_tp PRIVATE "O1HEAP_CONFIG_HEADER=\"${R}/include/rex/o1heap_config.h\"")
 quiet(rex_tp)
 
+
+# FFmpeg (libavutil + libavcodec, the XMA/WMA-Pro decoder): the SDK's own trimmed build, taken from its
+# thirdparty/CMakeLists.txt so the file lists stay identical to the SDK's.
+set(IS_X86_64 TRUE)
+set(IS_ARM64 FALSE)
+file(READ ${T}/CMakeLists.txt _sdk_tp)
+string(FIND "${_sdk_tp}" "set(FFMPEG_DIR" _ff_begin)
+string(FIND "${_sdk_tp}" "FOLDER \"FFmpeg\")" _ff_end)
+if(_ff_begin EQUAL -1 OR _ff_end EQUAL -1)
+    message(FATAL_ERROR "Could not find the FFmpeg block in the SDK's thirdparty/CMakeLists.txt")
+endif()
+math(EXPR _ff_len "${_ff_end} - ${_ff_begin} + 40")
+string(SUBSTRING "${_sdk_tp}" ${_ff_begin} ${_ff_len} _ff_block)
+string(REPLACE "\${CMAKE_CURRENT_SOURCE_DIR}" "${T}" _ff_block "${_ff_block}")
+file(WRITE ${CMAKE_BINARY_DIR}/ffmpeg_block.cmake "${_ff_block}")
+include(${CMAKE_BINARY_DIR}/ffmpeg_block.cmake)
+
 # ReXGlue, the headless subset -----------------------------------------------------------------
 function(rex_srcs out dir)
     set(l)
@@ -122,8 +139,9 @@ rex_srcs(KRN kernel
     xboxkrnl/xboxkrnl_video.cpp xboxkrnl/xboxkrnl_xconfig.cpp xboxkrnl/xboxkrnl_audio.cpp
     xboxkrnl/xboxkrnl_audio_xma.cpp crt/heap.cpp crt/file.cpp crt/memory.cpp crt/string.cpp crt/threading.cpp)
 # UI: only what the kernel references (dialogs, window and app-context types); no SDL, Vulkan or overlays.
-rex_srcs(UI ui windowed_app_context.cpp window.cpp imgui_dialog.cpp imgui_drawer.cpp immediate_drawer.cpp)
-rex_srcs(AUD audio audio_driver.cpp audio_system.cpp downmix.cpp xma_register_file.cpp nop/nop_audio_system.cpp)
+rex_srcs(UI ui windowed_app_context.cpp window.cpp imgui_dialog.cpp imgui_drawer.cpp immediate_drawer.cpp presenter.cpp)
+rex_srcs(AUD audio audio_driver.cpp audio_system.cpp downmix.cpp xma_register_file.cpp xma_context.cpp
+    xma_decoder.cpp nop/nop_audio_system.cpp)
 rex_srcs(INP input input_system.cpp device_assignment.cpp state_merge.cpp nop/nop_input_driver.cpp)
 
 # Files that fail to build the first time are listed in the optional skip list so the rest still link
@@ -135,7 +153,7 @@ foreach(s ${REX_SKIP})
 endforeach()
 add_library(rexps4 STATIC ${ALL_REX})
 target_include_directories(rexps4 PUBLIC ${T}/fmt/include ${T}/spdlog/include)
-target_link_libraries(rexps4 PUBLIC rex_tp)
+target_link_libraries(rexps4 PUBLIC rex_tp libavcodec libavutil)
 target_compile_options(rexps4 PRIVATE -Wno-error)
 
 # The recompiled game --------------------------------------------------------------------------
@@ -147,7 +165,8 @@ target_link_libraries(wwe_recomp PRIVATE rexps4)
 target_compile_options(wwe_recomp PRIVATE -w -g0)
 
 # The program ----------------------------------------------------------------------------------
-add_executable(wwe_headless main.cpp stubs.cpp)
+set(WWE_AUTO_STUBS "" CACHE FILEPATH "Generated stand-ins for the game's hook functions (scripts do this)")
+add_executable(wwe_headless main.cpp stubs.cpp ${WWE_AUTO_STUBS})
 target_include_directories(wwe_headless PRIVATE ${WWE_DIR} ${WWE_DIR}/src ${WWE_DIR}/generated/default)
 target_link_libraries(wwe_headless PRIVATE wwe_recomp rexps4)
 target_link_options(wwe_headless PRIVATE --error-limit=0)

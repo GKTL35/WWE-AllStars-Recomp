@@ -1,0 +1,20 @@
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..9f66379 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -334,6 +334,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+     }
+ #endif
+ 
++#if !REX_PLATFORM_PS4  // the PS4 build has no SDL or window; its pad driver is added by the app
+     if (REXCVAR_GET(input_backend) == "sdl") {
+       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
+       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
+@@ -346,6 +347,7 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
+       input->AddDriver(std::move(mnk_driver));
+     }
++#endif
+   }
+ 
+   // NOP driver (primary in tool mode, fallback otherwise)
