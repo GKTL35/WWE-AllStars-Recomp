@@ -1,0 +1,198 @@
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..6e193e0 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -32,6 +32,9 @@
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
++#elif defined(__PS4__)
++// PlayStation 4 (OpenOrbis, FreeBSD-derived kernel, x86-64). Not Linux: no /proc, no Linux ucontext.
++#define REX_PLATFORM_PS4 1
+ #elif defined(__ANDROID__)
+ #define REX_PLATFORM_ANDROID 1
+ #define REX_PLATFORM_LINUX 1
+@@ -50,6 +53,9 @@
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
++#ifndef REX_PLATFORM_PS4
++#define REX_PLATFORM_PS4 0
++#endif
+ #ifndef REX_PLATFORM_ANDROID
+ #define REX_PLATFORM_ANDROID 0
+ #endif
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..db0d4a8 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -14,7 +14,9 @@
+ #include <rex/platform.h>
+ #include <cstddef>
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_PS4
++#include <cstdint>
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+ // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+ // before including <ucontext.h>.
+@@ -56,6 +58,16 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
++#elif REX_PLATFORM_PS4
++  // Hand-written x86-64 switch (fiber_ps4.cpp): OpenOrbis only stubs makecontext.
++  void* sp_ = nullptr;  // saved stack pointer while the fiber is not running
++  uint8_t* stack_ = nullptr;
++  size_t stack_size_ = 0;
++  void (*entry_)(void*) = nullptr;
++  void* arg_ = nullptr;
++  bool is_thread_fiber_ = false;
++
++  static void Trampoline();
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+diff --git a/src/core/fiber_ps4.cpp b/src/core/fiber_ps4.cpp
+new file mode 100644
+index 0000000..5329c07
+--- /dev/null
++++ b/src/core/fiber_ps4.cpp
+@@ -0,0 +1,136 @@
++/**
++ * @file        rex/core/fiber_ps4.cpp
++ * @brief       PS4 (x86-64 System V) backend for rex::thread::Fiber
++ *
++ * EXPERIMENTAL. OpenOrbis only declares makecontext/swapcontext as stubs, so the switch is a
++ * hand-written register swap. Saved state: rbp, rbx, r12-r15, MXCSR and the x87 control word
++ * (everything the System V ABI makes callee-saved). The routine is plain x86-64, so it is
++ * testable on any Linux x86-64 host (see tests/fiber_ps4_selftest.cpp).
++ *
++ * @license     BSD 3-Clause License
++ */
++
++#include <rex/platform.h>
++#if REX_PLATFORM_PS4
++
++#include <rex/thread/fiber.h>
++
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++
++extern "C" void rex_ps4_fiber_switch(void** save_sp, void* load_sp);
++
++// Frame layout at a saved sp (low to high): [mxcsr:u32 fpucw:u16 pad:u16] r15 r14 r13 r12 rbx rbp
++// [return address]. A new fiber's frame is built by hand so the first switch "returns" into
++// Trampoline with rsp = 8 (mod 16), as after a call.
++__asm__(R"(
++.text
++.globl rex_ps4_fiber_switch
++.type rex_ps4_fiber_switch,@function
++.p2align 4
++rex_ps4_fiber_switch:
++    pushq %rbp
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    subq  $8, %rsp
++    stmxcsr (%rsp)
++    fnstcw  4(%rsp)
++    movq  %rsp, (%rdi)
++    movq  %rsi, %rsp
++    ldmxcsr (%rsp)
++    fldcw   4(%rsp)
++    addq  $8, %rsp
++    popq  %r15
++    popq  %r14
++    popq  %r13
++    popq  %r12
++    popq  %rbx
++    popq  %rbp
++    ret
++.size rex_ps4_fiber_switch, .-rex_ps4_fiber_switch
++)");
++
++namespace rex::thread {
++
++thread_local Fiber* Fiber::tls_current_ = nullptr;
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;  // its sp_ is filled in by the first SwitchTo away from it
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  constexpr size_t kGuard = 4096;
++  constexpr size_t kAlign = 16;
++  stack_size = (stack_size + kAlign - 1) & ~(kAlign - 1);
++
++  // One mapping: [guard page][stack]. The guard turns an overflow into a fault the crash log shows.
++  const size_t total = stack_size + kGuard;
++  void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++  if (mem == MAP_FAILED) {
++    return nullptr;
++  }
++  mprotect(mem, kGuard, PROT_NONE);
++
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_ = static_cast<uint8_t*>(mem);
++  f->stack_size_ = total;
++
++  uintptr_t top = reinterpret_cast<uintptr_t>(mem) + total;
++  top &= ~static_cast<uintptr_t>(kAlign - 1);
++
++  // slot[0] = return address slot (16-aligned), slot[1] = fake caller return address (0).
++  auto* ret_slot = reinterpret_cast<uint64_t*>(top - 16);
++  ret_slot[0] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);
++  ret_slot[1] = 0;
++
++  // Below the return address: rbp rbx r12 r13 r14 r15 (6 x 8), then the 8-byte FP control slot.
++  auto* frame = ret_slot - 6 - 1;
++  std::memset(frame, 0, 7 * sizeof(uint64_t));
++  const uint32_t mxcsr = 0x1F80;  // default: all exceptions masked, round to nearest
++  const uint16_t fpucw = 0x037F;  // default: extended precision, all exceptions masked
++  std::memcpy(reinterpret_cast<uint8_t*>(frame), &mxcsr, 4);
++  std::memcpy(reinterpret_cast<uint8_t*>(frame) + 4, &fpucw, 2);
++  f->sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  // tls_current_ was updated by SwitchTo before the switch landed here.
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++  // A fiber entry must switch away for good instead of returning: there is no caller to return to.
++  std::abort();
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_ps4_fiber_switch(&from->sp_, target->sp_);
++}
++
++void Fiber::Destroy() {
++  if (is_thread_fiber_) {
++    tls_current_ = nullptr;
++  } else {
++    if (this == tls_current_) {
++      std::abort();  // destroying the running fiber
++    }
++    if (stack_) {
++      munmap(stack_, stack_size_);
++    }
++  }
++  delete this;
++}
++
++}  // namespace rex::thread
++
++#endif  // REX_PLATFORM_PS4
