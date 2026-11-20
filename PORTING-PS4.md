@@ -19,9 +19,8 @@ Three PS4 recomp ports by iHaiDeeZ already exist, two of them ReXGlue/Xbox 360 g
 | SMW (Mario Wonder) | Switch | MIT. Publishes prebuilt OpenOrbis libc++ and RADV-for-PS4 static libraries as "SMW PS4 SDK 1". **[V]** |
 
 All of them build on **ps4-kit**, "the shared PS4 base of these ports (toolchain setup,
-runtime, Mesa RADV for the PS4, VideoOut swapchain, packaging)". **ps4-kit is not
-published.** **[V]** (MP3-PS4 README). That is the main blocker for this port: either
-the author shares it, or its parts are rebuilt from the published pieces.
+runtime, Mesa RADV for the PS4, VideoOut swapchain, packaging)". **ps4-kit is
+public** (https://github.com/iHaiDeeZ/ps4-kit, MIT, read at commit `79d173b`). **[V]** See section 1a.
 
 Findings in MP3-PS4's README that apply to any ReXGlue game on PS4 **[V]**:
 
@@ -38,6 +37,40 @@ Findings in MP3-PS4's README that apply to any ReXGlue game on PS4 **[V]**:
   become a multiply and an add (no FMA unit). Compare with this repo's
   `-ffp-contract=off` in `CMakeLists.txt`.
 - The main thread, not the GPU, limits frame rate on the PS4's 1.6 GHz Jaguar cores.
+
+## 1a. ps4-kit, as read (commit 79d173b) **[V]**
+
+Layout: `toolchain/` (clang 21 + libc++ 21, libc header overlay, sysroot scripts), `runtime/`
+(dlmalloc heap, stdio lock, `*at` file layer, crash log, sampler), `gpu/` (`build-mesa.sh` plus 32 patches on
+Mesa 26.0.8, `ps4_vk_wsi.*` Vulkan swapchain on VideoOut), `scripts/` (pkg, upload, crash log),
+`samples/kit-test/` (template). A new port is `include(ps4-kit.cmake)`, `ps4_kit_link_mesa(app)`,
+`ps4_kit_app(app)`. Setup order: `scripts/seed-build-tree.sh`, `gpu/build-mesa.sh`, `samples/kit-test/build.sh`
+(WSL, then upload from Windows). It mentions no ReXGlue or Xbox 360 code; the 360 side (guest memory, fibers,
+fault handling) lives in the ports, not the kit.
+
+What it settles for this plan:
+
+- **Fault handling (section 3, item 4):** the toolchain overlay fixes the PS4 `ucontext_t` (machine context at
+  byte 0x40, rip = word 20) and adds `machine/fpu.h`, which RPCS3 and Vita3K fault handlers already use. A ReXGlue
+  fault handler can read and edit registers through it. Still needs writing and testing for ReXGlue.
+- **Threads:** `ps4_boost_thread` (priority 650), `ps4_kit_set_min_thread_stack`, `ps4_new_thread_cores`
+  (0x7F when the 7th core is available). Matches the thread-priority finding in section 1.
+- **Memory:** a dlmalloc heap capped at 256 MiB in the system pool by default, overflow heaps and direct
+  memory beyond that, `PROT_NONE` reservations optionally treated as address-space-only
+  (`ps4_kit_set_mmap_reserve_prot_none`, from xemu), and the Mesa patch set turns on
+  `sceKernelEnableDmemAliasing` for placed maps. So aliasing and large reservations have prior art; the exact
+  guest-memory layout is still MP3-PS4's code (GPL) or new work.
+- **GPU:** Mesa 26.0.8 RADV, built `-O3 -march=btver2`, Vulkan 1.3 in the kit's own benchmark. PS4-specific
+  patches I read: no conditional rendering (`VK_EXT_conditional_rendering` off, CP firmware hang), a
+  `QUAD_LIST` topology, a 4x larger GS ring. **Nothing in the kit lists the Vulkan features the Native renderer
+  needs** (`bufferDeviceAddress`, runtime descriptor arrays, partially bound, update-unused-while-pending,
+  `shaderInt64`, dynamic rendering). RADV exposes them on stock Mesa, and `EXT_buffer_device_address` appears in
+  the PS4 extension list, but it must be confirmed on the console with a `vkGetPhysicalDeviceFeatures2` dump.
+- **Render thread cost:** `docs/gpu-thread-performance.md` measured about 6 microseconds per draw on the
+  render thread (about 2 microseconds in `vkCmdDrawIndexed` itself) on Jaguar. That sets the draw budget for 60 fps.
+- **Still open:** fibers. `makecontext`/`swapcontext` do not appear in the kit; MP3-PS4 or a hand-written
+  switch is still needed. Also XMA/FFmpeg cross-build, and the audio and input drivers in this repo (the kit has
+  no audio or pad code; written against the OpenOrbis headers only).
 
 ## 2. What in this repo is platform-specific
 
@@ -97,7 +130,7 @@ signatures (`sceAudioOutOpen`, `sceAudioOutOutput`, `scePadReadState`,
 ## 5. Suggested order of work
 
 1. **Get the PC build working first.** The repo's own notes say it has never run on Linux or Proton (`docs/research/performance-and-low-end-hardware.md:57`); it has only been built on Windows. A Linux x86-64 build is the nearest step to PS4 and also helps the Android goal. Needs the disc image and Title Update 2 from your own console.
-2. **Read MP3-PS4's `patches/sdk-ps4.patch` and `docs/DEVELOPMENT.md`**, and ask the author about ps4-kit (Discord link in the MP3-PS4 README).
+2. **Set up ps4-kit and run `samples/kit-test` on the console** (proves toolchain, Mesa and upload). **Read MP3-PS4's `patches/sdk-ps4.patch` and `docs/DEVELOPMENT.md`**.
 3. **Headless boot on PS4**: SDK core only (memory, threads, fibers, faults, clock), log output, no graphics. Success is the game's code running to the first GPU call.
 4. **Graphics**: bring up Vulkan on the PS4 and test the feature list in section 2 before anything else.
 5. **Audio, input, packaging**, using the drivers here.
@@ -105,7 +138,7 @@ signatures (`sceAudioOutOpen`, `sceAudioOutOutput`, `scePadReadState`,
 
 ## 6. Risks
 
-- **ps4-kit is unpublished.** Without it, toolchain setup, RADV for the PS4 and the VideoOut swapchain must be rebuilt from SMW's published SDK libraries or written from scratch.
+- **ps4-kit is MIT but young** (32 commits, no releases) and its build is WSL-only with a hardcoded OpenOrbis path (`/opt/pacbrew/ps4/openorbis`); expect setup friction.
 - **Vulkan features** the Native renderer requires may be missing from RADV-for-PS4.
 - **60 fps** may be out of reach on the Jaguar cores (MP3-PS4 does not hold 30 in busy fights). A 30 fps option, or lower detail, may be needed.
 - **Memory**: bindless heaps, shader pack, texture caches and the 4 GB reservation all compete for the console's memory.
