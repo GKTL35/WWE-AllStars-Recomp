@@ -171,14 +171,35 @@ if(WWE_GRAPHICS)
         vulkan/vulkan_immediate_drawer.cpp vulkan/vulkan_instance.cpp vulkan/vulkan_mem_alloc.cpp
         vulkan/vulkan_presenter.cpp vulkan/vulkan_provider.cpp vulkan/vulkan_submission_tracker.cpp
         vulkan/vulkan_upload_buffer_pool.cpp vulkan/vulkan_util.cpp)
-    # glslang's SPIR-V builder (what the shader translator emits through), without the GLSL front end.
-    set(SPV ${T}/glslang/SPIRV)
-    add_library(rex_spirv STATIC ${SPV}/SpvBuilder.cpp ${SPV}/SpvPostProcess.cpp ${SPV}/InReadableOrder.cpp
-        ${SPV}/Logger.cpp ${SPV}/doc.cpp ${SPV}/disassemble.cpp)
-    target_include_directories(rex_spirv PUBLIC ${T}/glslang ${T}/spirv-headers/include)
-    target_compile_definitions(rex_spirv PRIVATE ENABLE_OPT=0)
-    quiet(rex_spirv)
-    list(APPEND GFX_EXTRA_LINK rex_spirv)
+    # glslang: the shader translator emits through its SPIR-V builder, and the command processor compiles
+    # GLSL (gamma, FXAA, tessellation helpers) at runtime. Built straight from its sources (its own CMake
+    # picks the OS from CMAKE_SYSTEM_NAME), without spirv-opt (ENABLE_OPT=0), as the SDK builds it.
+    set(GL ${T}/glslang)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/glslang_gen/glslang)
+    file(WRITE ${CMAKE_BINARY_DIR}/glslang_gen/glslang/build_info.h
+"#ifndef GLSLANG_BUILD_INFO
+#define GLSLANG_BUILD_INFO
+#define GLSLANG_VERSION_MAJOR 15
+#define GLSLANG_VERSION_MINOR 0
+#define GLSLANG_VERSION_PATCH 0
+#define GLSLANG_VERSION_FLAVOR \"\"
+#define GLSLANG_VERSION_GREATER_THAN(major, minor, patch) (((major) > GLSLANG_VERSION_MAJOR) || ((major) == GLSLANG_VERSION_MAJOR && (((minor) > GLSLANG_VERSION_MINOR) || ((minor) == GLSLANG_VERSION_MINOR && ((patch) > GLSLANG_VERSION_PATCH)))))
+#define GLSLANG_VERSION_GREATER_OR_EQUAL_TO(major, minor, patch) (((major) > GLSLANG_VERSION_MAJOR) || ((major) == GLSLANG_VERSION_MAJOR && (((minor) > GLSLANG_VERSION_MINOR) || ((minor) == GLSLANG_VERSION_MINOR && ((patch) >= GLSLANG_VERSION_PATCH)))))
+#define GLSLANG_VERSION_LESS_THAN(major, minor, patch) (((major) < GLSLANG_VERSION_MAJOR) || ((major) == GLSLANG_VERSION_MAJOR && (((minor) < GLSLANG_VERSION_MINOR) || ((minor) == GLSLANG_VERSION_MINOR && ((patch) < GLSLANG_VERSION_PATCH)))))
+#define GLSLANG_VERSION_LESS_OR_EQUAL_TO(major, minor, patch) (((major) < GLSLANG_VERSION_MAJOR) || ((major) == GLSLANG_VERSION_MAJOR && (((minor) < GLSLANG_VERSION_MINOR) || ((minor) == GLSLANG_VERSION_MINOR && ((patch) <= GLSLANG_VERSION_PATCH)))))
+#endif
+")
+    file(GLOB GL_MI ${GL}/glslang/MachineIndependent/*.cpp ${GL}/glslang/MachineIndependent/preprocessor/*.cpp)
+    file(GLOB GL_GCG ${GL}/glslang/GenericCodeGen/*.cpp)
+    add_library(rex_glslang STATIC ${GL_MI} ${GL_GCG} ${GL}/OGLCompilersDLL/InitializeDll.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/glslang_ps4_os.cpp
+        ${GL}/SPIRV/GlslangToSpv.cpp ${GL}/SPIRV/SpvBuilder.cpp ${GL}/SPIRV/SpvPostProcess.cpp
+        ${GL}/SPIRV/InReadableOrder.cpp ${GL}/SPIRV/Logger.cpp ${GL}/SPIRV/doc.cpp ${GL}/SPIRV/disassemble.cpp
+        ${GL}/SPIRV/SpvTools.cpp)
+    target_include_directories(rex_glslang PUBLIC ${GL} ${CMAKE_BINARY_DIR}/glslang_gen ${T}/spirv-headers/include)
+    target_compile_definitions(rex_glslang PUBLIC ENABLE_OPT=0 GLSLANG_OSINCLUDE_UNIX)
+    quiet(rex_glslang)
+    list(APPEND GFX_EXTRA_LINK rex_glslang)
 endif()
 rex_srcs(AUD audio audio_driver.cpp audio_system.cpp downmix.cpp xma_register_file.cpp xma_context.cpp
     xma_decoder.cpp nop/nop_audio_system.cpp)
