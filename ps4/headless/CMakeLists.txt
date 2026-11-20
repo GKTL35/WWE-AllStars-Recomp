@@ -27,7 +27,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
 
 # Flags every SDK and game file gets (the SDK's own: strict FP, no strict aliasing).
 add_compile_options(-fno-strict-aliasing -ffp-model=strict -ffp-contract=off -fno-char8_t -O1)
-add_compile_definitions(REX_PLATFORM_PS4=1 REXGLUE_BUILD_CONFIG="Release" REX_HAS_VULKAN=0
+option(WWE_GRAPHICS "Build the graphics version (allstars) on top of the headless pieces" ON)
+if(WWE_GRAPHICS)
+    set(WWE_VK 1)
+else()
+    set(WWE_VK 0)
+endif()
+add_compile_definitions(REX_PLATFORM_PS4=1 REXGLUE_BUILD_CONFIG="Release"
     SPDLOG_FMT_EXTERNAL=1 SPDLOG_COMPILED_LIB=1 FMT_UNICODE=0)
 # Third-party code is not ours to fix.
 function(quiet)
@@ -62,7 +68,8 @@ target_include_directories(rex_tp_headers INTERFACE
     ${T}/disruptorplus/include ${T}/tomlplusplus/include ${T}/simde ${T}/simde/simde
     ${T}/utfcpp/source ${T}/cli11/include ${T}/imgui ${T}/xxHash ${T}/spirv-headers/include
     ${T}/vulkan-headers/include ${T}/sdl3/include ${T}/o1heap/o1heap ${T}/aes_128 ${T}
-    ${T}/libmspack/cabextract/mspack ${T}/renderdoc)
+    ${T}/libmspack/cabextract/mspack ${T}/renderdoc
+    ${T}/vulkan-memory-allocator/include ${T}/spirv-tools/include ${T}/glslang ${T}/stb)
 target_link_libraries(rex_tp_headers INTERFACE fmt::fmt spdlog::spdlog)
 target_compile_definitions(rex_tp_headers INTERFACE XXH_INLINE_ALL=1)
 
@@ -143,6 +150,36 @@ rex_srcs(KRN kernel
     xboxkrnl/xboxkrnl_audio_xma.cpp crt/heap.cpp crt/file.cpp crt/memory.cpp crt/string.cpp crt/threading.cpp)
 # UI: only what the kernel references (dialogs, window and app-context types); no SDL, Vulkan or overlays.
 rex_srcs(UI ui windowed_app_context.cpp window.cpp imgui_dialog.cpp imgui_drawer.cpp immediate_drawer.cpp presenter.cpp)
+if(WWE_GRAPHICS)
+    # The SDK's Vulkan Xenos GPU, its presenter, and the Vulkan UI layer (no SDL, no overlays).
+    rex_srcs(GFX graphics
+        flags.cpp register_file.cpp registers.cpp pipeline/shader/shader.cpp format/ucode.cpp sampler_info.cpp
+        graphics_system.cpp command_processor.cpp util/draw_extent_estimator.cpp util/draw.cpp
+        packet_disassembler.cpp primitive_processor.cpp pipeline/render_target/cache.cpp shared_memory.cpp
+        pipeline/texture/cache.cpp pipeline/shader/interpreter.cpp pipeline/shader/translator.cpp
+        pipeline/shader/translator_disasm.cpp
+        pipeline/shader/spirv_builder.cpp pipeline/shader/spirv.cpp pipeline/shader/spirv_translator.cpp
+        pipeline/shader/spirv_translator_alu.cpp pipeline/shader/spirv_translator_fetch.cpp
+        pipeline/shader/spirv_translator_memexport.cpp pipeline/shader/spirv_translator_rb.cpp
+        vulkan/graphics_system.cpp vulkan/deferred_command_buffer.cpp vulkan/command_processor.cpp
+        vulkan/pipeline_cache.cpp vulkan/primitive_processor.cpp vulkan/render_target_cache.cpp
+        vulkan/shader.cpp vulkan/shared_memory.cpp vulkan/texture_cache.cpp)
+    rex_srcs(UIVK ui
+        graphics_upload_buffer_pool.cpp graphics_util.cpp image_decode.cpp renderdoc_api.cpp menu_item.cpp
+        vulkan/linked_type_descriptor_set_allocator.cpp vulkan/single_layout_descriptor_set_pool.cpp
+        vulkan/spirv_tools_context.cpp vulkan/ui_samplers.cpp vulkan/vulkan_device.cpp
+        vulkan/vulkan_immediate_drawer.cpp vulkan/vulkan_instance.cpp vulkan/vulkan_mem_alloc.cpp
+        vulkan/vulkan_presenter.cpp vulkan/vulkan_provider.cpp vulkan/vulkan_submission_tracker.cpp
+        vulkan/vulkan_upload_buffer_pool.cpp vulkan/vulkan_util.cpp)
+    # glslang's SPIR-V builder (what the shader translator emits through), without the GLSL front end.
+    set(SPV ${T}/glslang/SPIRV)
+    add_library(rex_spirv STATIC ${SPV}/SpvBuilder.cpp ${SPV}/SpvPostProcess.cpp ${SPV}/InReadableOrder.cpp
+        ${SPV}/Logger.cpp ${SPV}/doc.cpp ${SPV}/disassemble.cpp)
+    target_include_directories(rex_spirv PUBLIC ${T}/glslang ${T}/spirv-headers/include)
+    target_compile_definitions(rex_spirv PRIVATE ENABLE_OPT=0)
+    quiet(rex_spirv)
+    list(APPEND GFX_EXTRA_LINK rex_spirv)
+endif()
 rex_srcs(AUD audio audio_driver.cpp audio_system.cpp downmix.cpp xma_register_file.cpp xma_context.cpp
     xma_decoder.cpp nop/nop_audio_system.cpp)
 rex_srcs(INP input input_system.cpp device_assignment.cpp state_merge.cpp nop/nop_input_driver.cpp)
@@ -150,13 +187,15 @@ rex_srcs(INP input input_system.cpp device_assignment.cpp state_merge.cpp nop/no
 # Files that fail to build the first time are listed in the optional skip list so the rest still link
 # (stubs for them go in stubs.cpp). Empty by default.
 set(REX_SKIP "" CACHE STRING "SDK source files (basename) to leave out")
-set(ALL_REX ${CORE} ${FS} ${SYS} ${KRN} ${UI} ${AUD} ${INP})
+set(ALL_REX ${CORE} ${FS} ${SYS} ${KRN} ${UI} ${AUD} ${INP} ${GFX} ${UIVK})
 foreach(s ${REX_SKIP})
     list(FILTER ALL_REX EXCLUDE REGEX "/${s}$")
 endforeach()
 add_library(rexps4 STATIC ${ALL_REX})
 target_include_directories(rexps4 PUBLIC ${T}/fmt/include ${T}/spdlog/include)
-target_link_libraries(rexps4 PUBLIC rex_tp libavcodec libavutil)
+target_link_libraries(rexps4 PUBLIC rex_tp libavcodec libavutil ${GFX_EXTRA_LINK})
+# Only the engine and the graphics program see REX_HAS_VULKAN: the generated game code stays as it was built.
+target_compile_definitions(rexps4 PRIVATE REX_HAS_VULKAN=${WWE_VK})
 target_compile_options(rexps4 PRIVATE -Wno-error)
 
 # The recompiled game --------------------------------------------------------------------------
@@ -174,3 +213,15 @@ target_include_directories(wwe_headless PRIVATE ${WWE_DIR} ${WWE_DIR}/src ${WWE_
 target_link_libraries(wwe_headless PRIVATE wwe_recomp rexps4)
 target_link_options(wwe_headless PRIVATE --error-limit=0)
 ps4_kit_app(wwe_headless)
+
+if(WWE_GRAPHICS)
+    # The game with graphics: the SDK's Vulkan Xenos GPU on the PS4's RADV, presented through VideoOut.
+    add_executable(allstars ../app/main.cpp ../app/ps4_ui.cpp stubs.cpp ${WWE_AUTO_STUBS})
+    target_include_directories(allstars PRIVATE ${WWE_DIR} ${WWE_DIR}/src ${WWE_DIR}/generated/default
+        ${CMAKE_CURRENT_LIST_DIR}/../app)
+    target_compile_definitions(allstars PRIVATE REX_HAS_VULKAN=1)
+    target_link_libraries(allstars PRIVATE wwe_recomp rexps4)
+    target_link_options(allstars PRIVATE --error-limit=0)
+    ps4_kit_link_mesa(allstars)
+    ps4_kit_app(allstars)
+endif()

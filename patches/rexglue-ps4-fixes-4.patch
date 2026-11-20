@@ -1,0 +1,209 @@
+diff --git a/include/rex/ui/surface.h b/include/rex/ui/surface.h
+index a302000..b1c5245 100644
+--- a/include/rex/ui/surface.h
++++ b/include/rex/ui/surface.h
+@@ -36,6 +36,8 @@ class Surface {
+     kTypeIndex_Win32Hwnd,
+     // macOS — CAMetalLayer presented via MoltenVK (VK_EXT_metal_surface).
+     kTypeIndex_CAMetalLayer,
++    // PS4 — VideoOut through the kit's VK_EXT_headless_surface swapchain.
++    kTypeIndex_Ps4VideoOut,
+   };
+   using TypeFlags = uint32_t;
+   enum : TypeFlags {
+@@ -44,6 +46,7 @@ class Surface {
+     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
+     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
+     kTypeFlag_CAMetalLayer = TypeFlags(1) << kTypeIndex_CAMetalLayer,
++    kTypeFlag_Ps4VideoOut = TypeFlags(1) << kTypeIndex_Ps4VideoOut,
+   };
+ 
+   Surface(const Surface& surface) = delete;
+diff --git a/include/rex/ui/surface_ps4.h b/include/rex/ui/surface_ps4.h
+new file mode 100644
+index 0000000..84c14d6
+--- /dev/null
++++ b/include/rex/ui/surface_ps4.h
+@@ -0,0 +1,26 @@
++#pragma once
++/**
++ * @file        ui/surface_ps4.h
++ * @brief       PS4 VideoOut surface (a fixed 1920x1080 screen)
++ */
++
++#include <rex/ui/surface.h>
++
++namespace rex {
++namespace ui {
++
++class Ps4VideoOutSurface final : public Surface {
++ public:
++  Ps4VideoOutSurface() = default;
++  TypeIndex GetType() const override { return kTypeIndex_Ps4VideoOut; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override {
++    width_out = 1920;
++    height_out = 1080;
++    return true;
++  }
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/vulkan/functions/instance_ext_headless_surface.inc b/include/rex/ui/vulkan/functions/instance_ext_headless_surface.inc
+new file mode 100644
+index 0000000..35c86b8
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/instance_ext_headless_surface.inc
+@@ -0,0 +1,2 @@
++// VK_EXT_headless_surface functions used in Xenia.
++XE_UI_VULKAN_FUNCTION(vkCreateHeadlessSurfaceEXT)
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index 4edde2b..f9f55ac 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -74,6 +74,10 @@ class VulkanInstance {
+     // VK_EXT_metal_surface (#217)
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+ #include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
++#endif
++    // VK_EXT_headless_surface (#257), the PS4's only surface
++#if REX_PLATFORM_PS4
++#include <rex/ui/vulkan/functions/instance_ext_headless_surface.inc>
+ #endif
+     // VK_KHR_get_physical_device_properties2 (#60, promoted to 1.1)
+ #include <rex/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc>
+@@ -105,6 +109,9 @@ class VulkanInstance {
+ #endif
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+     bool ext_EXT_metal_surface = false;  // #217
++#endif
++#if REX_PLATFORM_PS4
++    bool ext_EXT_headless_surface = false;  // #257
+ #endif
+     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+     bool ext_EXT_debug_utils = false;                          // #129
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..1067d53 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -20,6 +20,11 @@
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
+ #include <rex/ui/vulkan/presenter.h>
++#if REX_PLATFORM_PS4
++// ps4-kit's WSI (gpu/ps4_vk_wsi.cpp): vkGetInstanceProcAddr of the static RADV + swapchain.
++extern "C" void* ps4kit_vk_get_instance_proc_addr(void);
++static void* ps4_vk_get_instance_proc_addr() { return ps4kit_vk_get_instance_proc_addr(); }
++#endif
+ 
+ #if REX_PLATFORM_MAC
+ #include "vulkan_moltenvk.h"
+@@ -74,6 +79,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+     }
+     return nullptr;
+   }
++#elif REX_PLATFORM_PS4
++  // The statically linked RADV, with the kit's VideoOut swapchain on top: no loader library.
++  loader_loaded = true;
+ #else
+   loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+   if (!loader_loaded) {
+@@ -82,11 +90,17 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   }
+ #endif
+ 
++#if REX_PLATFORM_PS4
++  ifn.vkGetInstanceProcAddr = PFN_vkGetInstanceProcAddr(ps4_vk_get_instance_proc_addr());
++  functions_loaded &= ifn.vkGetInstanceProcAddr != nullptr;
++  // vkDestroyInstance is taken from the instance below (the kit has no loader to ask).
++#else
+ #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
+   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
+   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
+ #undef XE_VULKAN_LOAD_LOADER_FUNCTION
++#endif
+   if (!functions_loaded) {
+     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
+     return nullptr;
+@@ -140,6 +154,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   if (with_surface) {
+     // #1.
+     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
++#if REX_PLATFORM_PS4
++    // #257.
++    requested_extensions.emplace("VK_EXT_headless_surface",
++                                 &vulkan_instance->extensions_.ext_EXT_headless_surface);
++#endif
+ #ifdef VK_USE_PLATFORM_XCB_KHR
+     // #6.
+     requested_extensions.emplace("VK_KHR_xcb_surface",
+@@ -386,6 +405,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+   // Load instance functions.
+ 
++#if REX_PLATFORM_PS4
++  ifn.vkDestroyInstance = PFN_vkDestroyInstance(
++      ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkDestroyInstance"));
++  functions_loaded &= ifn.vkDestroyInstance != nullptr;
++#endif
+ #define XE_UI_VULKAN_FUNCTION(name)                                                            \
+   functions_loaded &=                                                                          \
+       (ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, #name))) != \
+@@ -441,6 +465,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   if (vulkan_instance->extensions_.ext_KHR_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+   }
++#if REX_PLATFORM_PS4
++  if (vulkan_instance->extensions_.ext_EXT_headless_surface) {
++#include <rex/ui/vulkan/functions/instance_ext_headless_surface.inc>
++  }
++#endif
+   if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
+ #include <rex/ui/vulkan/functions/instance_ext_debug_utils.inc>
+   }
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..421f8b4 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -45,6 +45,9 @@
+ #if REX_PLATFORM_MAC
+ #include <rex/ui/surface_mac.h>
+ #endif
++#if REX_PLATFORM_PS4
++#include <rex/ui/surface_ps4.h>
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+@@ -423,6 +426,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+     return 0;
+   }
+   Surface::TypeFlags type_flags = 0;
++#if REX_PLATFORM_PS4
++  if (instance_extensions.ext_EXT_headless_surface) {
++    type_flags |= Surface::kTypeFlag_Ps4VideoOut;
++  }
++#endif
+ #if REX_PLATFORM_ANDROID
+   if (instance_extensions.ext_KHR_android_surface) {
+     type_flags |= Surface::kTypeFlag_AndroidNativeWindow;
+@@ -796,6 +804,16 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+     }
+     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
+     switch (surface_type) {
++#if REX_PLATFORM_PS4
++      case Surface::kTypeIndex_Ps4VideoOut: {
++        VkHeadlessSurfaceCreateInfoEXT surface_create_info;
++        surface_create_info.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
++        surface_create_info.pNext = nullptr;
++        surface_create_info.flags = 0;
++        vulkan_surface_create_result = ifn.vkCreateHeadlessSurfaceEXT(
++            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
++      } break;
++#endif
+ #if REX_PLATFORM_ANDROID
+       case Surface::kTypeIndex_AndroidNativeWindow: {
+         auto& android_native_window_surface =
