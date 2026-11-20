@@ -77,7 +77,7 @@ int main() {
   }
   Say("graphics presentation ready");
 
-  auto window = rex::ui::Window::Create(context, "AllStars_Recomp", 1920, 1080);
+  auto window = rex::ui::Window::Create(context, "WWEAllStarsRecomp", 1920, 1080);
   if (!window || !window->Open()) {
     Fail("window FAILED", 11);
   }
