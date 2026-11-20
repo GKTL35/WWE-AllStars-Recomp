@@ -6,7 +6,9 @@
 #include <orbis/UserService.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <string>
 
 #include <rex/logging.h>
 
@@ -67,7 +69,7 @@ DeviceId Ps4InputDriver::IdForSlot(size_t slot) {
 
 Ps4InputDriver::Pad* Ps4InputDriver::PadFor(DeviceId id) {
   const uint64_t raw = static_cast<uint64_t>(id);
-  if (raw < kIdBase || raw >= kIdBase + pad_count_) {
+  if (raw < kIdBase || raw >= kIdBase + kMaxGuestUsers) {
     return nullptr;
   }
   Pad& pad = pads_[raw - kIdBase];
@@ -79,38 +81,78 @@ X_STATUS Ps4InputDriver::Setup() {
   // initialised" error from either is not a failure.
   sceUserServiceInitialize(nullptr);
   scePadInit();
+  std::lock_guard<std::mutex> lock(mutex_);
+  RescanLocked();
+  REXLOG_INFO("PS4 input: {} pad(s) opened", pad_count_);
+  // No pads is not fatal: they are looked for again while the game polls, so a
+  // controller that is switched on or assigned later shows up.
+  return X_STATUS_SUCCESS;
+}
 
+// Opens a pad for every logged-in user that has one and is not open yet.
+void Ps4InputDriver::RescanLocked() {
   OrbisUserServiceLoginUserIdList users;
   std::memset(&users, 0, sizeof(users));
   if (sceUserServiceGetLoginUserIdList(&users) < 0) {
-    REXLOG_ERROR("PS4 input: sceUserServiceGetLoginUserIdList() failed");
-    return X_STATUS_UNSUCCESSFUL;
+    return;
   }
-
-  std::lock_guard<std::mutex> lock(mutex_);
-  pad_count_ = 0;
   for (const auto user : users.userId) {
-    if (user == ORBIS_USER_SERVICE_USER_ID_INVALID || pad_count_ >= kMaxGuestUsers) {
+    if (user == ORBIS_USER_SERVICE_USER_ID_INVALID) {
       continue;
+    }
+    bool open_already = false;
+    for (const auto& pad : pads_) {
+      if (pad.handle >= 0 && pad.user_id == user) {
+        open_already = true;
+      }
+    }
+    if (open_already) {
+      continue;
+    }
+    Pad* slot = nullptr;
+    for (auto& pad : pads_) {
+      if (pad.handle < 0) {
+        slot = &pad;
+        break;
+      }
+    }
+    if (!slot) {
+      break;
     }
     const int32_t handle = scePadOpen(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, nullptr);
     if (handle < 0) {
-      // The user is logged in but has no pad assigned yet; skip, don't fail.
-      continue;
+      continue;  // logged in, no pad assigned (yet)
     }
-    Pad& pad = pads_[pad_count_++];
-    pad.user_id = user;
-    pad.handle = handle;
+    slot->user_id = user;
+    slot->handle = handle;
+    slot->packet = 0;
+    slot->last_buttons = 0;
   }
-  REXLOG_INFO("PS4 input: {} pad(s) opened", pad_count_);
-  // No pads is not fatal: EnumerateDevices() then reports none and the guest
-  // sees "not connected" until a controller is assigned (hot-plug TODO).
-  return X_STATUS_SUCCESS;
+  pad_count_ = 0;
+  for (const auto& pad : pads_) {
+    pad_count_ += pad.handle >= 0 ? 1 : 0;
+  }
 }
 
 void Ps4InputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   std::lock_guard<std::mutex> lock(mutex_);
-  for (size_t i = 0; i < pad_count_; ++i) {
+  // A pad that dropped out is closed, and every free slot is looked at again, once a second.
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_rescan_ > std::chrono::seconds(1)) {
+    last_rescan_ = now;
+    for (auto& pad : pads_) {
+      if (pad.handle >= 0) {
+        OrbisPadData probe;
+        std::memset(&probe, 0, sizeof(probe));
+        if (scePadReadState(pad.handle, &probe) < 0) {
+          scePadClose(pad.handle);
+          pad.handle = -1;
+        }
+      }
+    }
+    RescanLocked();
+  }
+  for (size_t i = 0; i < pads_.size(); ++i) {
     if (pads_[i].handle < 0) {
       continue;
     }

@@ -216,9 +216,11 @@ ps4_kit_app(wwe_headless)
 
 if(WWE_GRAPHICS)
     # The game with graphics: the SDK's Vulkan Xenos GPU on the PS4's RADV, presented through VideoOut.
-    add_executable(allstars ../app/main.cpp ../app/ps4_ui.cpp stubs.cpp ${WWE_AUTO_STUBS})
+    add_executable(allstars ../app/main.cpp ../app/ps4_ui.cpp ../audio/ps4_audio.cpp ../input/ps4_input_driver.cpp
+        stubs.cpp ${WWE_AUTO_STUBS})
     target_include_directories(allstars PRIVATE ${WWE_DIR} ${WWE_DIR}/src ${WWE_DIR}/generated/default
-        ${CMAKE_CURRENT_LIST_DIR}/../app)
+        ${CMAKE_CURRENT_LIST_DIR}/../app ${CMAKE_CURRENT_LIST_DIR}/..)
+    target_link_libraries(allstars PRIVATE -lSceAudioOut -lScePad -lSceUserService)
     target_compile_definitions(allstars PRIVATE REX_HAS_VULKAN=1)
     target_link_libraries(allstars PRIVATE wwe_recomp rexps4)
     target_link_options(allstars PRIVATE --error-limit=0)

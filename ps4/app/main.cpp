@@ -1,8 +1,9 @@
 // All Stars Recomp for PS4, stage 2: the recompiled game with the SDK's Vulkan Xenos GPU, shown on VideoOut.
-// (Audio and input come next.) Files on the console:
+// Sound goes to sceAudioOut, the pads are DualShock 4s. Files on the console:
 //   /data/wwe/gamedata/default.xex (+ disc contents), /data/wwe/updatedata/default.xexp
 // Logs: /data/wwe/game.log and /data/wwe/game.stage.log
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/input/input_system.h>
 #include <rex/image_info.h>
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
@@ -20,6 +21,8 @@
 #include <thread>
 
 #include "generated/default/wweallstars_init.h"
+#include "audio/ps4_audio.h"
+#include "input/ps4_input_driver.h"
 #include "ps4_ui.h"
 
 extern "C" unsigned long long ps4kit_flip_count(void);
@@ -32,6 +35,19 @@ void Say(const char* msg) {
     std::fprintf(f, "%s\n", msg);
     std::fclose(f);
   }
+}
+
+// The default input system (NOP stand-in, slot assignment) plus the DualShock 4 driver: one pad per
+// logged-in PS4 user becomes one Xbox 360 pad for the game.
+std::unique_ptr<rex::system::IInputSystem> CreatePs4InputSystem(bool tool_mode) {
+  auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+  if (!tool_mode) {
+    auto pads = std::make_unique<rex::input::ps4::Ps4InputDriver>(nullptr, 0);
+    if (pads->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(pads));
+    }
+  }
+  return input;
 }
 
 [[noreturn]] void Fail(const char* msg, int code) {
@@ -78,6 +94,8 @@ int main() {
   rex::RuntimeConfig config;
   config.kernel_init = rex::kernel::InitializeKernel;
   config.graphics = std::move(graphics);
+  config.audio_factory = REX_AUDIO_BACKEND(rex::audio::ps4::Ps4AudioSystem);
+  config.input_factory = REX_INPUT_BACKEND(CreatePs4InputSystem);
   config.tool_mode = false;
   Say("runtime constructed");
 

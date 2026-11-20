@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -46,9 +47,11 @@ class Ps4InputDriver final : public InputDriver {
   // Device ids encode the slot, so a stale id never aliases another pad.
   static DeviceId IdForSlot(size_t slot);
   Pad* PadFor(DeviceId id);
+  void RescanLocked();  // mutex_ held
 
   std::array<Pad, kMaxGuestUsers> pads_{};
   size_t pad_count_ = 0;
+  std::chrono::steady_clock::time_point last_rescan_{};
   std::mutex mutex_;
 };
 
