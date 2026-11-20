@@ -1,0 +1,830 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..c17a88f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,6 +158,11 @@ if(WIN32)
+         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
++elseif(REX_TARGET_PS4)
++    # PlayStation 4 via OpenOrbis + ps4-kit (EXPERIMENTAL). Pass -DREX_TARGET_PS4=ON together with
++    # ps4-kit's toolchain file, which also defines __PS4__.
++    set(REX_PLATFORM "ps4-amd64")
++    add_compile_definitions(REX_PLATFORM_PS4=1)
+ elseif(UNIX AND NOT APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..36264d3 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -32,6 +32,12 @@
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
++#elif defined(__PS4__)
++// PlayStation 4 (OpenOrbis, FreeBSD-derived kernel, x86-64). Counts as the POSIX family
++// (REX_PLATFORM_LINUX stays 1 so the shared posix sources build) but is NOT Linux: no /proc, no
++// Linux ucontext, no futex. Linux-only code paths must test !REX_PLATFORM_PS4.
++#define REX_PLATFORM_PS4 1
++#define REX_PLATFORM_LINUX 1
+ #elif defined(__ANDROID__)
+ #define REX_PLATFORM_ANDROID 1
+ #define REX_PLATFORM_LINUX 1
+@@ -50,6 +56,9 @@
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
++#ifndef REX_PLATFORM_PS4
++#define REX_PLATFORM_PS4 0
++#endif
+ #ifndef REX_PLATFORM_ANDROID
+ #define REX_PLATFORM_ANDROID 0
+ #endif
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..db0d4a8 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -14,7 +14,9 @@
+ #include <rex/platform.h>
+ #include <cstddef>
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_PS4
++#include <cstdint>
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+ // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+ // before including <ucontext.h>.
+@@ -56,6 +58,16 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
++#elif REX_PLATFORM_PS4
++  // Hand-written x86-64 switch (fiber_ps4.cpp): OpenOrbis only stubs makecontext.
++  void* sp_ = nullptr;  // saved stack pointer while the fiber is not running
++  uint8_t* stack_ = nullptr;
++  size_t stack_size_ = 0;
++  void (*entry_)(void*) = nullptr;
++  void* arg_ = nullptr;
++  bool is_thread_fiber_ = false;
++
++  static void Trampoline();
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..5335193 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -53,6 +53,26 @@ if(WIN32)
+         threading_win.cpp
+     )
+     target_compile_definitions(rexcore PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
++elseif(REX_TARGET_PS4)
++    # PS4: the posix sources for everything that is portable, PS4-specific memory and fibers.
++    target_sources(rexcore PRIVATE
++        atomic_posix.cpp
++        clock_posix.cpp
++        dbg_posix.cpp
++        dynlib_posix.cpp
++        exception_handler_posix.cpp
++        filesystem_posix.cpp
++        fiber_ps4.cpp
++        mapped_memory_posix.cpp
++        math_gcc.cpp
++        memory_ps4.cpp
++        platform/console_posix.cpp
++        platform/env_posix.cpp
++        seh_posix.cpp
++        socket_posix.cpp
++        system_posix.cpp
++        threading_posix.cpp
++    )
+ elseif(UNIX)
+     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
+     # is selected inside them with #if defined(__APPLE__).
+diff --git a/src/core/clock_posix.cpp b/src/core/clock_posix.cpp
+index 00f2382..921214e 100644
+--- a/src/core/clock_posix.cpp
++++ b/src/core/clock_posix.cpp
+@@ -25,6 +25,10 @@ uint64_t Clock::host_tick_frequency_platform() {
+   mach_timebase_info_data_t info;
+   mach_timebase_info(&info);
+   return (uint64_t)((1000000000ull * (uint64_t)info.denom) / (uint64_t)info.numer);
++#elif REX_PLATFORM_PS4
++  // clock_getres() answers 2 ns on the PS4, which made this 500 MHz while the ticks below are
++  // nanoseconds: the 360 clock ran too fast (MP3-PS4 README). Ticks are nanoseconds, so 1 GHz.
++  return 1000000000ull;
+ #else
+   timespec res;
+   int error = clock_getres(CLOCK_MONOTONIC_RAW, &res);
+@@ -45,7 +49,12 @@ uint64_t Clock::host_tick_count_platform() {
+   return mach_absolute_time();
+ #else
+   timespec tp;
++#if REX_PLATFORM_PS4
++  // FreeBSD clock ids have no MONOTONIC_RAW; the ps4-kit runtime backs clock_gettime with the TSC.
++  int error = clock_gettime(CLOCK_MONOTONIC, &tp);
++#else
+   int error = clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
++#endif
+   assert_zero(error);
+ 
+   return tp.tv_nsec + tp.tv_sec * 1000000000ull;
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..7c10bc9 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -30,13 +30,19 @@
+ #include <rex/platform.h>
+ 
+ #include <ucontext.h>
++#if REX_PLATFORM_PS4
++// FreeBSD register layout of the PS4 signal context (mc_* fields, machine context at byte 0x40,
++// struct savefpu for the XMM registers). Both come from ps4-kit's libc overlay
++// (toolchain/ucontext-overlay.sh checks the layout against the hardware's).
++#include <machine/fpu.h>
++#endif
+ 
+ namespace rex::arch {
+ 
+ bool signal_handlers_installed_ = false;
+ struct sigaction original_sigill_handler_;
+ struct sigaction original_sigsegv_handler_;
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS4
+ struct sigaction original_sigbus_handler_;
+ #endif
+ 
+@@ -85,6 +91,29 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+   thread_context.r15 = uint64_t(mcontext->__ss.__r15);
+   std::memcpy(thread_context.xmm_registers, &mcontext->__fs.__fpu_xmm0,
+               sizeof(thread_context.xmm_registers));
++#elif REX_PLATFORM_PS4
++  thread_context.rip = uint64_t(mcontext.mc_rip);
++  thread_context.eflags = uint32_t(mcontext.mc_rflags);
++  thread_context.rax = uint64_t(mcontext.mc_rax);
++  thread_context.rcx = uint64_t(mcontext.mc_rcx);
++  thread_context.rdx = uint64_t(mcontext.mc_rdx);
++  thread_context.rbx = uint64_t(mcontext.mc_rbx);
++  thread_context.rsp = uint64_t(mcontext.mc_rsp);
++  thread_context.rbp = uint64_t(mcontext.mc_rbp);
++  thread_context.rsi = uint64_t(mcontext.mc_rsi);
++  thread_context.rdi = uint64_t(mcontext.mc_rdi);
++  thread_context.r8 = uint64_t(mcontext.mc_r8);
++  thread_context.r9 = uint64_t(mcontext.mc_r9);
++  thread_context.r10 = uint64_t(mcontext.mc_r10);
++  thread_context.r11 = uint64_t(mcontext.mc_r11);
++  thread_context.r12 = uint64_t(mcontext.mc_r12);
++  thread_context.r13 = uint64_t(mcontext.mc_r13);
++  thread_context.r14 = uint64_t(mcontext.mc_r14);
++  thread_context.r15 = uint64_t(mcontext.mc_r15);
++  {
++    const auto* fpu = reinterpret_cast<const savefpu*>(mcontext.mc_fpstate);
++    std::memcpy(thread_context.xmm_registers, fpu->sv_xmm, sizeof(thread_context.xmm_registers));
++  }
+ #else
+   thread_context.rip = uint64_t(mcontext.gregs[REG_RIP]);
+   thread_context.eflags = uint32_t(mcontext.gregs[REG_EFL]);
+@@ -171,7 +200,9 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       // On macOS, SIGBUS (KERN_PROTECTION_FAILURE) is raised for writes to
+       // read-protected pages — the same scenario that raises SIGSEGV on Linux.
+       // Fall through to treat it as an access violation.
+-#if !REX_PLATFORM_MAC
++#if !REX_PLATFORM_MAC && !REX_PLATFORM_PS4
++      // PS4: the FreeBSD kernel raises SIGBUS for some page faults on guest memory; ps4-kit's
++      // fault handlers install it alongside SIGSEGV, so it is handled like the Mac case.
+       // On non-Mac POSIX, SIGBUS is a bus error (misaligned access), not a
+       // protection fault — don't handle it here.
+       assert_unhandled_case(signal_number);
+@@ -187,6 +218,10 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       access_violation_operation = (uint64_t(mcontext->__es.__err) & kX86PageFaultErrorCodeWrite)
+                                        ? Exception::AccessViolationOperation::kWrite
+                                        : Exception::AccessViolationOperation::kRead;
++#elif REX_PLATFORM_PS4
++      access_violation_operation = (uint64_t(mcontext.mc_err) & kX86PageFaultErrorCodeWrite)
++                                       ? Exception::AccessViolationOperation::kWrite
++                                       : Exception::AccessViolationOperation::kRead;
+ #else
+       access_violation_operation = (uint64_t(mcontext.gregs[REG_ERR]) & kX86PageFaultErrorCodeWrite)
+                                        ? Exception::AccessViolationOperation::kWrite
+@@ -331,6 +366,30 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                         modified_register_index * sizeof(vec128_t),
+                     &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
+       }
++#elif REX_PLATFORM_PS4
++      mcontext.mc_rip = thread_context.rip;
++      mcontext.mc_rflags = thread_context.eflags;
++      uint32_t modified_register_index;
++      // The order must match the order in X64Register.
++      register_t* const kIntRegisterMap[] = {
++          &mcontext.mc_rax, &mcontext.mc_rcx, &mcontext.mc_rdx, &mcontext.mc_rbx,
++          &mcontext.mc_rsp, &mcontext.mc_rbp, &mcontext.mc_rsi, &mcontext.mc_rdi,
++          &mcontext.mc_r8,  &mcontext.mc_r9,  &mcontext.mc_r10, &mcontext.mc_r11,
++          &mcontext.mc_r12, &mcontext.mc_r13, &mcontext.mc_r14, &mcontext.mc_r15,
++      };
++      uint16_t modified_int_registers_remaining = ex.modified_int_registers();
++      while (rex::bit_scan_forward(modified_int_registers_remaining, &modified_register_index)) {
++        modified_int_registers_remaining &= ~(UINT16_C(1) << modified_register_index);
++        *kIntRegisterMap[modified_register_index] =
++            thread_context.int_registers[modified_register_index];
++      }
++      uint16_t modified_xmm_registers_remaining = ex.modified_xmm_registers();
++      auto* fpu = reinterpret_cast<savefpu*>(mcontext.mc_fpstate);
++      while (rex::bit_scan_forward(modified_xmm_registers_remaining, &modified_register_index)) {
++        modified_xmm_registers_remaining &= ~(UINT16_C(1) << modified_register_index);
++        std::memcpy(&fpu->sv_xmm[modified_register_index],
++                    &thread_context.xmm_registers[modified_register_index], sizeof(vec128_t));
++      }
+ #else
+       mcontext.gregs[REG_RIP] = greg_t(thread_context.rip);
+       mcontext.gregs[REG_EFL] = greg_t(thread_context.eflags);
+@@ -433,7 +492,7 @@ void ExceptionHandler::Install(Handler fn, void* data) {
+     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
+       assert_always("Failed to install new SIGSEGV handler");
+     }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS4
+     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
+       assert_always("Failed to install new SIGBUS handler");
+     }
+@@ -478,7 +537,7 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
+       if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGSEGV handler");
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_PS4
+       if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGBUS handler");
+       }
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..13edc3b 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -17,7 +17,7 @@
+ #endif
+ 
+ #include <rex/platform.h>
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if (REX_PLATFORM_LINUX && !REX_PLATFORM_PS4) || REX_PLATFORM_MAC
+ 
+ #include <rex/thread/fiber.h>
+ 
+@@ -81,4 +81,4 @@ void Fiber::Destroy() {
+ 
+ }  // namespace rex::thread
+ 
+-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#endif  // (REX_PLATFORM_LINUX && !REX_PLATFORM_PS4) || REX_PLATFORM_MAC
+diff --git a/src/core/fiber_ps4.cpp b/src/core/fiber_ps4.cpp
+new file mode 100644
+index 0000000..5329c07
+--- /dev/null
++++ b/src/core/fiber_ps4.cpp
+@@ -0,0 +1,136 @@
++/**
++ * @file        rex/core/fiber_ps4.cpp
++ * @brief       PS4 (x86-64 System V) backend for rex::thread::Fiber
++ *
++ * EXPERIMENTAL. OpenOrbis only declares makecontext/swapcontext as stubs, so the switch is a
++ * hand-written register swap. Saved state: rbp, rbx, r12-r15, MXCSR and the x87 control word
++ * (everything the System V ABI makes callee-saved). The routine is plain x86-64, so it is
++ * testable on any Linux x86-64 host (see tests/fiber_ps4_selftest.cpp).
++ *
++ * @license     BSD 3-Clause License
++ */
++
++#include <rex/platform.h>
++#if REX_PLATFORM_PS4
++
++#include <rex/thread/fiber.h>
++
++#include <cstdlib>
++#include <cstring>
++#include <sys/mman.h>
++
++extern "C" void rex_ps4_fiber_switch(void** save_sp, void* load_sp);
++
++// Frame layout at a saved sp (low to high): [mxcsr:u32 fpucw:u16 pad:u16] r15 r14 r13 r12 rbx rbp
++// [return address]. A new fiber's frame is built by hand so the first switch "returns" into
++// Trampoline with rsp = 8 (mod 16), as after a call.
++__asm__(R"(
++.text
++.globl rex_ps4_fiber_switch
++.type rex_ps4_fiber_switch,@function
++.p2align 4
++rex_ps4_fiber_switch:
++    pushq %rbp
++    pushq %rbx
++    pushq %r12
++    pushq %r13
++    pushq %r14
++    pushq %r15
++    subq  $8, %rsp
++    stmxcsr (%rsp)
++    fnstcw  4(%rsp)
++    movq  %rsp, (%rdi)
++    movq  %rsi, %rsp
++    ldmxcsr (%rsp)
++    fldcw   4(%rsp)
++    addq  $8, %rsp
++    popq  %r15
++    popq  %r14
++    popq  %r13
++    popq  %r12
++    popq  %rbx
++    popq  %rbp
++    ret
++.size rex_ps4_fiber_switch, .-rex_ps4_fiber_switch
++)");
++
++namespace rex::thread {
++
++thread_local Fiber* Fiber::tls_current_ = nullptr;
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;  // its sp_ is filled in by the first SwitchTo away from it
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  constexpr size_t kGuard = 4096;
++  constexpr size_t kAlign = 16;
++  stack_size = (stack_size + kAlign - 1) & ~(kAlign - 1);
++
++  // One mapping: [guard page][stack]. The guard turns an overflow into a fault the crash log shows.
++  const size_t total = stack_size + kGuard;
++  void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++  if (mem == MAP_FAILED) {
++    return nullptr;
++  }
++  mprotect(mem, kGuard, PROT_NONE);
++
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_ = static_cast<uint8_t*>(mem);
++  f->stack_size_ = total;
++
++  uintptr_t top = reinterpret_cast<uintptr_t>(mem) + total;
++  top &= ~static_cast<uintptr_t>(kAlign - 1);
++
++  // slot[0] = return address slot (16-aligned), slot[1] = fake caller return address (0).
++  auto* ret_slot = reinterpret_cast<uint64_t*>(top - 16);
++  ret_slot[0] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);
++  ret_slot[1] = 0;
++
++  // Below the return address: rbp rbx r12 r13 r14 r15 (6 x 8), then the 8-byte FP control slot.
++  auto* frame = ret_slot - 6 - 1;
++  std::memset(frame, 0, 7 * sizeof(uint64_t));
++  const uint32_t mxcsr = 0x1F80;  // default: all exceptions masked, round to nearest
++  const uint16_t fpucw = 0x037F;  // default: extended precision, all exceptions masked
++  std::memcpy(reinterpret_cast<uint8_t*>(frame), &mxcsr, 4);
++  std::memcpy(reinterpret_cast<uint8_t*>(frame) + 4, &fpucw, 2);
++  f->sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  // tls_current_ was updated by SwitchTo before the switch landed here.
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++  // A fiber entry must switch away for good instead of returning: there is no caller to return to.
++  std::abort();
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_ps4_fiber_switch(&from->sp_, target->sp_);
++}
++
++void Fiber::Destroy() {
++  if (is_thread_fiber_) {
++    tls_current_ = nullptr;
++  } else {
++    if (this == tls_current_) {
++      std::abort();  // destroying the running fiber
++    }
++    if (stack_) {
++      munmap(stack_, stack_size_);
++    }
++  }
++  delete this;
++}
++
++}  // namespace rex::thread
++
++#endif  // REX_PLATFORM_PS4
+diff --git a/src/core/memory_ps4.cpp b/src/core/memory_ps4.cpp
+new file mode 100644
+index 0000000..55a0434
+--- /dev/null
++++ b/src/core/memory_ps4.cpp
+@@ -0,0 +1,272 @@
++/**
++ * @file        rex/core/memory_ps4.cpp
++ * @brief       PS4 (OpenOrbis, FreeBSD kernel) backend for rex::memory
++ *
++ * EXPERIMENTAL / UNTESTED: never run on a console. Written against OpenOrbis' libkernel and the
++ * way ps4-kit's Mesa patches use direct memory (gpu/mesa-patches/0002, 0031).
++ *
++ * Why this differs from memory_posix.cpp: the posix backend backs the 4.5 GiB guest arena with
++ * one sparse shm file and maps views of it. The PS4 has no sparse shared memory, and direct
++ * memory is real RAM. So the "file mapping" here is only a table of what each file offset means:
++ *
++ *   offset <  0x1'0000'0000  ordinary guest virtual address space (views 0x0..0xFFFFFFFF with no
++ *                            alias): address space is reserved, host pages are committed on
++ *                            demand with an anonymous mapping (AllocFixed kCommit).
++ *   offset >= 0x1'0000'0000  the 512 MiB guest physical memory: ONE direct-memory allocation,
++ *                            mapped at every alias (0xA0000000, 0xC0000000, 0xE0000000 +4 KiB,
++ *                            and the raw 0x1'0000'0000 view). Needs sceKernelEnableDmemAliasing.
++ *
++ * KNOWN LIMITATION: the views at 0x80000000 and 0x90000000 alias the same file offset on the
++ * 360 (the same XEX memory through 64 KiB and 4 KiB pages). Here they are two independent
++ * reservations, because aliasing them would need 256 MiB of real direct memory. Code that
++ * writes through one view and reads through the other will not see the data. The XEX image is
++ * loaded through the 0x80000000 view; check this if modules ever load through 0x90000000.
++ *
++ * Page granularity: direct memory maps in 16 KiB units; the guest uses 4 KiB pages, so
++ * allocation_granularity() is 64 KiB and the SDK's existing "host page larger than guest page"
++ * path (host_address_offset, as used on macOS / Android) takes care of the rest.
++ */
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_PS4
++
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++
++#include <sys/mman.h>
++#include <sys/types.h>
++
++#include <rex/logging.h>
++#include <rex/memory/utils.h>
++
++// libkernel. Declared by hand, as ps4-kit does: no header prototype can then clash.
++extern "C" {
++int sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t len, size_t align,
++                                  int type, off_t* phys);
++int sceKernelReleaseDirectMemory(off_t start, size_t len);
++int sceKernelMapDirectMemory(void** addr, size_t len, int prot, int flags, off_t phys,
++                             size_t align);
++int sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t align);
++int sceKernelMunmap(void* addr, size_t len);
++int sceKernelMprotect(const void* addr, size_t len, int prot);
++int sceKernelEnableDmemAliasing(void);
++size_t sceKernelGetDirectMemorySize(void);
++}
++
++namespace rex {
++namespace memory {
++
++namespace {
++
++constexpr int kProtCpuRead = 0x01;
++constexpr int kProtCpuWrite = 0x02;
++constexpr int kProtCpuExec = 0x04;
++constexpr int kMapFixed = 0x10;
++constexpr int kWbOnion = 0;  // CPU-cached direct memory
++constexpr size_t kDirectPage = 0x4000;  // 16 KiB
++constexpr size_t kGranularity = 0x10000;  // 64 KiB, what the SDK is told
++
++constexpr uint64_t kPhysicalFileOffset = 0x100000000ull;  // see map_info in xmemory.cpp
++constexpr uint64_t kPhysicalSize = 0x20000000ull;         // 512 MiB
++
++struct PhysicalBacking {
++  off_t phys = -1;       // direct-memory offset
++  size_t size = 0;
++  bool aliasing_on = false;
++};
++
++// One guest arena per process: a single mapping handle, as in the other backends.
++PhysicalBacking g_backing;
++constexpr FileMappingHandle kHandle = 1;
++
++int ToProt(PageAccess access) {
++  switch (access) {
++    case PageAccess::kNoAccess:
++      return 0;
++    case PageAccess::kReadOnly:
++      return kProtCpuRead;
++    case PageAccess::kReadWrite:
++      return kProtCpuRead | kProtCpuWrite;
++    case PageAccess::kExecuteReadOnly:
++      return kProtCpuRead | kProtCpuExec;
++    case PageAccess::kExecuteReadWrite:
++      return kProtCpuRead | kProtCpuWrite | kProtCpuExec;
++  }
++  return 0;
++}
++
++}  // namespace
++
++size_t page_size() {
++  return kDirectPage;
++}
++size_t allocation_granularity() {
++  return kGranularity;
++}
++
++bool IsWritableExecutableMemorySupported() {
++  // The ps4-kit runtime probes this at startup (ps4_exec_probe); the guest code is ahead-of-time
++  // compiled, so the guest never needs executable memory itself.
++  return false;
++}
++
++void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
++                 PageAccess access) {
++  const int prot = ToProt(access);
++
++  if (allocation_type == AllocationType::kReserve) {
++    // Address space only, no memory behind it. FIXED only when asked for a specific address.
++    void* addr = base_address;
++    const int r = sceKernelReserveVirtualRange(&addr, length, base_address ? kMapFixed : 0, 0);
++    if (r != 0 || (base_address && addr != base_address)) {
++      return nullptr;
++    }
++    return addr;
++  }
++
++  // kCommit / kReserveCommit: anonymous memory. On an address that is currently a reservation,
++  // MAP_FIXED replaces the reservation with backed pages (the reservation holds no memory, so
++  // nothing is lost). Never FIXED over an address nothing reserved: the caller asked for it.
++  int flags = MAP_PRIVATE | MAP_ANON;
++  if (base_address) {
++    flags |= MAP_FIXED;
++  }
++  void* result = mmap(base_address, length, prot & (kProtCpuRead | kProtCpuWrite), flags, -1, 0);
++  if (result == MAP_FAILED) {
++    return nullptr;
++  }
++  if (prot & kProtCpuExec) {
++    sceKernelMprotect(result, length, prot);
++  }
++  return result;
++}
++
++bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
++  switch (deallocation_type) {
++    case DeallocationType::kDecommit: {
++      // Give the memory back but keep the address range reserved, so a later commit can map it.
++      void* addr = base_address;
++      if (sceKernelMunmap(base_address, length) != 0) {
++        return false;
++      }
++      return sceKernelReserveVirtualRange(&addr, length, kMapFixed, 0) == 0;
++    }
++    case DeallocationType::kRelease:
++      return sceKernelMunmap(base_address, length) == 0;
++    default:
++      return false;
++  }
++}
++
++bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
++  if (out_old_access) {
++    // sceKernelVirtualQuery could report this; the callers that use it only ever restore
++    // read-write, so report that rather than guess per page.
++    *out_old_access = PageAccess::kReadWrite;
++  }
++  const int r = sceKernelMprotect(base_address, length, ToProt(access));
++  if (r != 0) {
++    REXSYS_ERROR("sceKernelMprotect({}, 0x{:X}) failed: 0x{:08X}", base_address, length,
++                 static_cast<uint32_t>(r));
++  }
++  return r == 0;
++}
++
++bool QueryProtect(void* /*base_address*/, size_t& length, PageAccess& access_out) {
++  // TODO: sceKernelVirtualQuery. Not needed until a caller depends on it on this platform.
++  access_out = PageAccess::kNoAccess;
++  length = 0;
++  return false;
++}
++
++FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& /*path*/, size_t length,
++                                          PageAccess /*access*/, bool /*commit*/) {
++  // length is the whole 4.5 GiB arena; only the physical part is real memory.
++  if (g_backing.phys >= 0) {
++    return kFileMappingHandleInvalid;  // one arena per process
++  }
++  if (length < kPhysicalFileOffset + kPhysicalSize) {
++    return kFileMappingHandleInvalid;
++  }
++  off_t phys = -1;
++  const int r = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()),
++                                              kPhysicalSize, kGranularity, kWbOnion, &phys);
++  if (r != 0) {
++    REXSYS_ERROR("PS4: no direct memory for the 512 MiB guest physical area: 0x{:08X}",
++                 static_cast<uint32_t>(r));
++    return kFileMappingHandleInvalid;
++  }
++  g_backing.phys = phys;
++  g_backing.size = kPhysicalSize;
++
++  // Several views of the same direct memory: the kernel refuses that unless aliasing is on.
++  g_backing.aliasing_on = (sceKernelEnableDmemAliasing() == 0);
++  if (!g_backing.aliasing_on) {
++    REXSYS_ERROR("PS4: sceKernelEnableDmemAliasing() refused; guest memory mirrors cannot work");
++  }
++  return kHandle;
++}
++
++void CloseFileMappingHandle(FileMappingHandle /*handle*/, const std::filesystem::path& /*path*/) {
++  if (g_backing.phys >= 0) {
++    sceKernelReleaseDirectMemory(g_backing.phys, g_backing.size);
++    g_backing = PhysicalBacking{};
++  }
++}
++
++void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
++                  size_t file_offset) {
++  if (handle != kHandle || (file_offset % kGranularity) != 0) {
++    return nullptr;
++  }
++
++  if (file_offset < kPhysicalFileOffset) {
++    // Plain guest virtual space: reserve only. Hint address, no FIXED: if the kernel puts it
++    // elsewhere this arena base is taken and the caller tries the next one.
++    void* addr = base_address;
++    if (sceKernelReserveVirtualRange(&addr, length, 0, 0) != 0) {
++      return nullptr;
++    }
++    if (base_address && addr != base_address) {
++      sceKernelMunmap(addr, length);
++      return nullptr;
++    }
++    return addr;
++  }
++
++  // A view of the physical area.
++  const uint64_t offset_in_phys = file_offset - kPhysicalFileOffset;
++  if (!g_backing.aliasing_on || offset_in_phys + length > g_backing.size + kGranularity) {
++    return nullptr;
++  }
++  // The 0xE0000000 view starts 4 KiB into the physical area (target 0x100001000); the SDK
++  // masks that to granularity before it gets here, and adds the 4 KiB itself on the CPU side.
++  void* addr = base_address;
++  const size_t map_len = (offset_in_phys + length > g_backing.size)
++                             ? static_cast<size_t>(g_backing.size - offset_in_phys)
++                             : length;
++  const int r = sceKernelMapDirectMemory(&addr, map_len, ToProt(access), 0,
++                                         g_backing.phys + static_cast<off_t>(offset_in_phys),
++                                         kGranularity);
++  if (r != 0) {
++    REXSYS_ERROR("PS4: mapping physical view at {} (+0x{:X}, 0x{:X}) failed: 0x{:08X}",
++                 base_address, offset_in_phys, map_len, static_cast<uint32_t>(r));
++    return nullptr;
++  }
++  if (base_address && addr != base_address) {
++    sceKernelMunmap(addr, map_len);
++    return nullptr;
++  }
++  return addr;
++}
++
++bool UnmapFileView(FileMappingHandle /*handle*/, void* base_address, size_t length) {
++  return sceKernelMunmap(base_address, length) == 0;
++}
++
++}  // namespace memory
++}  // namespace rex
++
++#endif  // REX_PLATFORM_PS4
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..6505772 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -49,7 +49,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <rex/string.h>
+ #endif
+ 
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_PS4
+ // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
+ #define REX_HAS_SIGEV_THREAD_ID 1
+ #ifdef __GLIBC__
+@@ -173,11 +173,37 @@ void install_signal_handler(SignalType type) {
+ // TODO(dougvj)
+ void EnableAffinityConfiguration() {}
+ 
++#if REX_PLATFORM_PS4
++// libkernel thread control. The ps4-kit runtime declares these the same way and passes
++// scePthreadSelf() as the thread; ASSUMPTION (untested): pthread_t and ScePthread are the same
++// object on OpenOrbis, since pthread_create/pthread_self resolve to libkernel's libthr.
++extern "C" {
++int scePthreadSetprio(void* thread, int prio) __asm__("scePthreadSetprio");
++int scePthreadGetprio(void* thread, int* prio) __asm__("scePthreadGetprio");
++int scePthreadSetaffinity(void* thread, uint64_t mask) __asm__("scePthreadSetaffinity");
++int scePthreadRename(void* thread, const char* name) __asm__("scePthreadRename");
++int scePthreadGetthreadid(void) __asm__("scePthreadGetthreadid");
++}
++// PS4 priorities run 256 (most urgent) to 767, default about 700. Guest priorities are the
++// Windows-style -15..+15 (0 normal). Equal priorities are not time-sliced on the PS4, so the
++// guest's relative priorities matter (MP3-PS4 README: applying them took busy fights from 4-5
++// to 13-17 fps). Heuristic mapping, 15 steps per guest level; tune on hardware.
++static int ps4_priority_from_guest(int guest) {
++  int p = 700 - guest * 15;
++  return p < 256 ? 256 : (p > 767 ? 767 : p);
++}
++static int guest_priority_from_ps4(int ps4) {
++  return (700 - ps4) / 15;
++}
++#endif
++
+ // uint64_t ticks() { return mach_absolute_time(); }
+ 
+ uint32_t current_thread_system_id() {
+ #if defined(__APPLE__)
+   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
++#elif REX_PLATFORM_PS4
++  return static_cast<uint32_t>(scePthreadGetthreadid());
+ #else
+   return static_cast<uint32_t>(syscall(SYS_gettid));
+ #endif
+@@ -655,7 +681,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       pthread_attr_destroy(&attr);
+       return false;
+     }
++#if REX_PLATFORM_PS4
++    const bool apply_priority_after_create = (params.initial_priority != 0);
++    if (false) {
++#else
+     if (params.initial_priority != 0) {
++#endif
+       sched_param sched{};
+       sched.sched_priority = params.initial_priority + 1;
+       if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
+@@ -672,6 +703,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return false;
+     }
+     pthread_attr_destroy(&attr);
++#if REX_PLATFORM_PS4
++    if (apply_priority_after_create) {
++      scePthreadSetprio(reinterpret_cast<void*>(thread_),
++                        ps4_priority_from_guest(params.initial_priority));
++    }
++#endif
+     return true;
+   }
+ 
+@@ -736,6 +773,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       if (pthread_equal(thread_, pthread_self())) {
+         pthread_setname_np(std::string(name).c_str());
+       }
++#elif REX_PLATFORM_PS4
++      scePthreadRename(reinterpret_cast<void*>(thread_), std::string(name).c_str());
+ #else
+       pthread_setname_np(thread_, std::string(name).c_str());
+ #endif
+@@ -799,6 +838,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
+     // no-op so higher layers can build and run.
+     (void)mask;
++#elif REX_PLATFORM_PS4
++    // The PS4 app owns a subset of the 8 Jaguar cores; the guest's mask is the 360's 6 hardware
++    // threads. Pass it through and let the kernel reject cores the app does not have.
++    scePthreadSetaffinity(reinterpret_cast<void*>(thread_), mask);
+ #else
+     cpu_set_t cpu_set;
+     CPU_ZERO(&cpu_set);
+@@ -821,6 +864,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   int priority() {
+     WaitStarted();
++#if REX_PLATFORM_PS4
++    int ps4_prio = 0;
++    if (scePthreadGetprio(reinterpret_cast<void*>(thread_), &ps4_prio) != 0) {
++      return -1;
++    }
++    return guest_priority_from_ps4(ps4_prio);
++#endif
+     int policy;
+     sched_param param{};
+     int ret = pthread_getschedparam(thread_, &policy, &param);
+@@ -833,6 +883,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void set_priority(int new_priority) {
+     WaitStarted();
++#if REX_PLATFORM_PS4
++    scePthreadSetprio(reinterpret_cast<void*>(thread_), ps4_priority_from_guest(new_priority));
++    return;
++#endif
+     sched_param param{};
+     param.sched_priority = new_priority;
+     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
+@@ -1511,6 +1565,8 @@ void Thread::Exit(int exit_code) {
+ void set_current_thread_name(const std::string_view name) {
+ #if defined(__APPLE__)
+   pthread_setname_np(std::string(name).c_str());
++#elif REX_PLATFORM_PS4
++  scePthreadRename(reinterpret_cast<void*>(pthread_self()), std::string(name).c_str());
+ #else
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
+ #endif

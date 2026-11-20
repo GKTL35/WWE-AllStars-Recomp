@@ -127,11 +127,37 @@ signatures (`sceAudioOutOpen`, `sceAudioOutOutput`, `scePadReadState`,
 - `audio_mute` is defined in `ps4_audio.cpp`; a PS4 build must not also compile the SDL audio driver.
 - Neither is wired into CMake yet, because the SDK picks backends itself (item 1).
 
+## 4a. PS4 platform patch for ReXGlue (`patches/rexglue-ps4-platform.patch`)
+
+Applies to ReXGlue v0.10.0 (`f5337cd`). **None of it has been run on a console; only the fiber
+switch was run natively on Linux x86-64 (`ps4/tests/fiber_ps4_selftest.cpp`).** Build switch:
+`-DREX_TARGET_PS4=ON` with ps4-kit's toolchain file.
+
+| Piece | What it does | Status |
+| --- | --- | --- |
+| `platform.h` | `REX_PLATFORM_PS4`; also sets `REX_PLATFORM_LINUX` so the posix sources build | written |
+| `fiber_ps4.cpp` | hand-written x86-64 register switch with a guard page | **ran natively** |
+| `memory_ps4.cpp` | guest arena: reserve address space, commit with anonymous mappings, the 512 MiB physical area as one direct-memory block aliased at 0xA0000000, 0xC0000000, 0xE0000000, 0x7F000000 and 0x100000000 | uncompiled, untested |
+| `clock_posix.cpp` | fixed 1 GHz tick rate (the PS4's `clock_getres` says 2 ns), `CLOCK_MONOTONIC` | uncompiled |
+| `threading_posix.cpp` | thread id, names, priorities (guest -15..+15 mapped to PS4 256..767), affinity via libkernel | uncompiled; assumes `pthread_t` is the `ScePthread` |
+| `exception_handler_posix.cpp` | fault handler using the FreeBSD register layout from ps4-kit's overlay; SIGBUS handled too | uncompiled |
+
+Known problems in it:
+
+- The guest views at 0x80000000 and 0x90000000 alias the same XEX memory on the 360. Here they are
+  two separate reservations (aliasing would cost 256 MiB of real RAM).
+- Direct memory needs `sceKernelEnableDmemAliasing`; if the kernel refuses it, the mirrors cannot work.
+- The 0xE0000000 view (4 KiB higher) relies on the SDK's existing larger-host-page path.
+- Still to adapt: `socket_posix`, `dynlib_posix`, `env_posix`, `console_posix`, `seh_posix`, `atomic_posix`,
+  `xthread.cpp`, the kernel's `xam_net.cpp`, and any other `REX_PLATFORM_LINUX` code. They were not read yet.
+- The OpenOrbis git repository has no libc headers (they ship in its release bundle), so none of this
+  could be syntax-checked here against the real headers.
+
 ## 5. Suggested order of work
 
 1. **Get the PC build working first.** The repo's own notes say it has never run on Linux or Proton (`docs/research/performance-and-low-end-hardware.md:57`); it has only been built on Windows. A Linux x86-64 build is the nearest step to PS4 and also helps the Android goal. Needs the disc image and Title Update 2 from your own console.
 2. **Set up ps4-kit and run `samples/kit-test` on the console** (proves toolchain, Mesa and upload). **Read MP3-PS4's `patches/sdk-ps4.patch` and `docs/DEVELOPMENT.md`**.
-3. **Headless boot on PS4**: SDK core only (memory, threads, fibers, faults, clock), log output, no graphics. Success is the game's code running to the first GPU call.
+3. **Headless boot on PS4** (platform patch in section 4a): SDK core only (memory, threads, fibers, faults, clock), log output, no graphics. Success is the game's code running to the first GPU call.
 4. **Graphics**: bring up Vulkan on the PS4 and test the feature list in section 2 before anything else.
 5. **Audio, input, packaging**, using the drivers here.
 6. **Performance**: thread priorities and cores, then the main thread. WWE runs at 60 fps, MP3 at 30, so the target is harder.
